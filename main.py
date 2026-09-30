@@ -3,6 +3,7 @@ import sys
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
+import uvicorn
 
 from fastapi import Request, FastAPI, HTTPException
 
@@ -103,3 +104,6 @@ async def handle_callback(request: Request):
         )
 
     return "OK"
+
+if __name__ == 'main':
+    uvicorn.run('main:app', port=int(os.getenv('PORT'))) # type: ignore
