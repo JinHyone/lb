@@ -104,6 +104,3 @@ async def handle_callback(request: Request):
         )
 
     return "OK"
-
-if __name__ == 'main':
-    uvicorn.run('main:app', host='0.0.0.0', port=int(os.getenv('PORT'))) # type: ignore
