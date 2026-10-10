@@ -5,18 +5,18 @@ import logging
 import os
 import re
 import sqlite3
+import json
+import secrets
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import json
-import secrets
 from zoneinfo import ZoneInfo
-import time
 
-import aiosqlite # pyright: ignore[reportMissingImports]
+import aiosqlite
 from dotenv import load_dotenv
-from fastapi.responses import FileResponse
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     AsyncApiClient,
@@ -40,6 +40,10 @@ TIMEZONE_NAME = os.getenv("TIMEZONE", "Asia/Seoul")
 RETENTION_DAYS = max(0, int(os.getenv("RETENTION_DAYS", "180")))
 MENTION_BATCH_LIMIT = max(1, min(20, int(os.getenv("MENTION_BATCH_LIMIT", "5"))))
 MAX_REPLY_CHARS = 4500
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+EXPORT_TTL = max(60, int(os.getenv("EXPORT_TTL", "600")))
+EXPORT_DIR = Path(os.getenv("EXPORT_DIR", "/tmp/line_bot_exports"))
+export_tokens: dict[str, tuple[str, float]] = {}
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -60,6 +64,80 @@ def utc_now() -> datetime:
 
 def iso_now() -> str:
     return utc_now().isoformat()
+
+
+def format_datetime(value: str | None) -> str:
+    """ISO 시각을 한국어 날짜·시간 형식으로 표시한다."""
+    if not value:
+        return "기록 없음"
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(ZoneInfo(TIMEZONE_NAME)).strftime("%Y년 %m월 %d일 %H:%M")
+    except (ValueError, TypeError):
+        return str(value)
+
+
+def cleanup_expired_exports() -> None:
+    now = time.time()
+    for token, (file_path, expires_at) in list(export_tokens.items()):
+        if expires_at <= now:
+            export_tokens.pop(token, None)
+            try:
+                Path(file_path).unlink(missing_ok=True)
+            except OSError:
+                log.warning("만료된 내보내기 파일 삭제 실패: %s", file_path)
+    if EXPORT_DIR.exists():
+        for path in EXPORT_DIR.glob("database_*.json"):
+            try:
+                if now - path.stat().st_mtime > EXPORT_TTL * 2:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                log.warning("오래된 내보내기 파일 정리 실패: %s", path)
+
+
+def export_database_to_json(output_path: Path) -> None:
+    """SQLite 데이터베이스의 테이블을 JSON으로 내보낸다."""
+    connection = sqlite3.connect(str(DB_PATH), timeout=10)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA busy_timeout=10000")
+        table_names = [
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        ]
+        result = {
+            "exported_at": datetime.now(ZoneInfo(TIMEZONE_NAME)).isoformat(),
+            "database": DB_PATH.name,
+            "tables": {},
+        }
+        for table_name in table_names:
+            # Table names come from sqlite_master and are quoted as identifiers.
+            escaped_name = table_name.replace('"', '""')
+            rows = connection.execute(f'SELECT * FROM "{escaped_name}"').fetchall()
+            result["tables"][table_name] = [dict(row) for row in rows]
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as file:
+            json.dump(result, file, ensure_ascii=False, indent=2, default=str)
+    finally:
+        connection.close()
+
+
+async def create_database_export() -> str:
+    cleanup_expired_exports()
+    if not PUBLIC_BASE_URL:
+        raise RuntimeError("PUBLIC_BASE_URL 환경변수가 설정되지 않았습니다.")
+    token = secrets.token_urlsafe(32)
+    file_path = EXPORT_DIR / f"database_{token}.json"
+    try:
+        await asyncio.to_thread(export_database_to_json, file_path)
+        export_tokens[token] = (str(file_path), time.time() + EXPORT_TTL)
+        return f"{PUBLIC_BASE_URL}/exports/{token}"
+    except Exception:
+        file_path.unlink(missing_ok=True)
+        raise
 
 
 def field(obj, *names, default=None):
@@ -346,13 +424,26 @@ async def statistics(chat_id: str | None = None):
         return {"total": total, "today": today_count, "users": user_count, "top": top}
 
 
-def format_stats(title, stats):
-    lines = [f"📊 {title}", f"누적 메시지: {stats['total']}",
-             f"오늘 메시지({TIMEZONE_NAME}): {stats['today']}", f"활동 사용자 수: {stats['users']}", "", "메시지 상위 사용자"]
-    for i, row in enumerate(stats["top"], 1):
-        lines.append(f"{i}. {row['user_id']}: {row['count']}개")
+async def format_stats(title, stats, source_type=None, chat_raw_id=None, api=None):
+    lines = [
+        f"📊 {title}",
+        "━━━━━━━━━━━━━━",
+        f"💬 누적 메시지  {stats['total']:,}개",
+        f"☀️ 오늘 메시지  {stats['today']:,}개",
+        f"👥 활동 사용자  {stats['users']:,}명",
+        "",
+        "🏆 메시지 TOP 5",
+    ]
     if not stats["top"]:
-        lines.append("아직 기록이 없습니다.")
+        lines.append("아직 집계된 메시지가 없어요.")
+    else:
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        for i, row in enumerate(stats["top"]):
+            user_id = row["user_id"]
+            name = None
+            if api is not None:
+                name = await display_name_for(source_type or "user", chat_raw_id, user_id, api)
+            lines.append(f"{medals[i]} {name or user_id}  ·  {row['count']:,}개")
     return "\n".join(lines)
 
 
@@ -424,151 +515,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="LINE Community Bot", version="1.0.0", lifespan=lifespan)
 
-# JSON 내보내기 파일 임시 저장 위치
-EXPORT_DIR = Path("/tmp/line_bot_exports")
-EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-
-# 다운로드 링크 유효 시간: 10분
-EXPORT_TTL = 600
-
-# 발급된 다운로드 토큰: {token: (파일 경로, 만료 시각)}
-export_tokens = {}
-
-# Render 환경변수에 실제 서비스 주소를 설정
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-
-
-def cleanup_expired_exports():
-    """만료된 내보내기 파일과 토큰 정리."""
-    now = time.time()
-
-    for token, (file_path, expires_at) in list(export_tokens.items()):
-        if now >= expires_at:
-            export_tokens.pop(token, None)
-
-            try:
-                Path(file_path).unlink(missing_ok=True)
-            except OSError:
-                pass
-
-
-def export_database_to_json(output_path: Path):
-    """SQLite의 모든 일반 테이블을 JSON 파일로 내보낸다."""
-
-    # 기존 프로젝트의 DB 경로 변수에 맞춰 사용
-    db_path = Path(os.getenv("DATABASE_PATH", str(DB_PATH)))
-
-    if not db_path.is_file():
-        raise FileNotFoundError(
-            f"데이터베이스 파일을 찾을 수 없습니다: {db_path}"
-        )
-
-    # 읽기 전용 연결로 데이터베이스 조회
-    connection = sqlite3.connect(
-        f"{db_path.resolve().as_uri()}?mode=ro",
-        uri=True,
-        timeout=10,
-    )
-    connection.row_factory = sqlite3.Row
-
-    try:
-        tables = connection.execute("""
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table'
-              AND name NOT LIKE 'sqlite_%'
-            ORDER BY name
-        """).fetchall()
-
-        result = {
-            "exported_at": datetime.now(timezone.utc).isoformat(),
-            "tables": {},
-        }
-
-        for table_row in tables:
-            table_name = table_row["name"]
-
-            # 테이블 이름은 SQLite 메타데이터에서 가져오므로
-            # 식별자 인용 시 큰따옴표를 이스케이프한다.
-            quoted_name = '"' + table_name.replace('"', '""') + '"'
-
-            rows = connection.execute(
-                f"SELECT * FROM {quoted_name}"
-            ).fetchall()
-
-            result["tables"][table_name] = [
-                dict(row) for row in rows
-            ]
-
-        with output_path.open("w", encoding="utf-8") as file:
-            json.dump(
-                result,
-                file,
-                ensure_ascii=False,
-                indent=2,
-                default=str,
-            )
-
-    finally:
-        connection.close()
-
-
-async def create_database_export():
-    """DB JSON 파일을 만들고 만료되는 다운로드 URL을 반환한다."""
-    cleanup_expired_exports()
-
-    if not PUBLIC_BASE_URL:
-        raise RuntimeError(
-            "PUBLIC_BASE_URL 환경변수가 설정되지 않았습니다."
-        )
-
-    token = secrets.token_urlsafe(32)
-    file_path = EXPORT_DIR / f"database_{token}.json"
-
-    try:
-        await asyncio.to_thread(
-            export_database_to_json,
-            file_path,
-        )
-
-        export_tokens[token] = (
-            str(file_path),
-            time.time() + EXPORT_TTL,
-        )
-
-        return f"{PUBLIC_BASE_URL}/exports/{token}"
-
-    except Exception:
-        file_path.unlink(missing_ok=True)
-        raise
-
-
-@app.get("/exports/{token}")
-async def download_database_export(token: str):
-    """토큰이 유효한 경우에만 JSON 파일을 다운로드한다."""
-    cleanup_expired_exports()
-
-    export = export_tokens.get(token)
-
-    if export is None:
-        raise HTTPException(
-            status_code=404,
-            detail="다운로드 링크가 만료되었거나 유효하지 않습니다.",
-        )
-
-    file_path, expires_at = export
-
-    if time.time() >= expires_at or not Path(file_path).is_file():
-        export_tokens.pop(token, None)
-        raise HTTPException(status_code=404, detail="파일이 만료되었습니다.")
-
-    return FileResponse(
-        path=file_path,
-        media_type="application/json",
-        filename="line_bot_database.json",
-        background=None,
-    )
-
 
 @app.get("/")
 async def health():
@@ -580,6 +526,21 @@ async def health_db():
     async with db_connect() as db:
         await (await db.execute("SELECT 1")).fetchone()
     return {"status": "ok", "database": "ok"}
+
+
+@app.get("/exports/{token}")
+async def download_database_export(token: str):
+    """유효한 임시 토큰으로 JSON 백업 파일을 내려받는다."""
+    cleanup_expired_exports()
+    item = export_tokens.get(token)
+    if not item:
+        raise HTTPException(status_code=404, detail="다운로드 링크가 만료되었거나 유효하지 않습니다.")
+    file_path, expires_at = item
+    if expires_at <= time.time() or not Path(file_path).is_file():
+        export_tokens.pop(token, None)
+        Path(file_path).unlink(missing_ok=True)
+        raise HTTPException(status_code=404, detail="다운로드 링크가 만료되었거나 유효하지 않습니다.")
+    return FileResponse(file_path, media_type="application/json", filename="database_export.json")
 
 
 @app.post("/callback")
@@ -597,7 +558,7 @@ async def callback(request: Request):
         raise HTTPException(status_code=400, detail="Invalid webhook payload")
 
     api = request.app.state.line_api
-    for event in events: # type: ignore
+    for event in events:
         if not isinstance(event, MessageEvent):
             continue
         source = event.source
@@ -610,18 +571,14 @@ async def callback(request: Request):
         text = field(message, "text") if message_type == "text" else None
         event_id = field(event, "webhook_event_id", "webhookEventId")
         targets, unresolved = mention_targets(message) if message_type == "text" else ([], 0)
-        
         try:
             result = await record_event(event_id, user_id, chat_id, message_type, text, targets, unresolved)
-        
         except Exception:
             log.exception("Database event processing failed")
             # Non-2xx encourages LINE retry. Idempotency prevents duplicate DB rows on retry.
             raise HTTPException(status_code=500, detail="Event persistence failed")
-        
         if result is None:
             continue
-        
         if message_type != "text" or not text:
             continue
 
@@ -630,36 +587,37 @@ async def callback(request: Request):
         claim = None
         is_admin = bool(user_id and user_id in ADMIN_USER_IDS)
 
-        if stripped == "!db":
-            print('db')
-            try:
-                download_url = await create_database_export()
-                reply_parts.append(f"DB JSON 내보내기가 완료되었습니다.\n다운로드: {download_url}\n링크는 10분 후 만료됩니다.")
-
-            except Exception as e:
-                # 실제 오류 내용이나 DB 경로는 채팅에 노출하지 않는다.
-                print(f"DB JSON 내보내기 실패\n{e}")
-                reply_parts.append("DB 내보내기에 실패했습니다. 서버 로그를 확인해 주세요.")
-
-        # Commands: !help, !stats, !stats all, !stats group, !stats me, !mentions
+        # 명령어 처리: 답장은 아래 공통 처리 구간에서 한 번에 전송한다.
         if stripped == "!help":
             reply_parts.append(
-                "명령어 안내\n!stats - 현재 대화방 통계 + 전체 통계\n"
-                "!stats all - 전체 통계(관리자)\n!stats group - 현재 대화방 통계\n"
-                "!stats me - 내 메시지 수\n!mentions - 내 미전달 멘션 확인\n!help - 도움말"
+                "📖 봇 명령어 안내\n"
+                "━━━━━━━━━━━━━━\n"
+                "📊 통계\n"
+                "• !stats — 현재 대화방 및 전체 통계\n"
+                "• !stats group — 현재 대화방 통계\n"
+                "• !stats me — 내 활동 기록\n"
+                "• !stats all — 전체 통계 (관리자 전용)\n\n"
+                "📨 멘션 기록\n"
+                "• !mentions — 확인하지 못한 멘션 기록\n\n"
+                "🛠️ 관리 기능\n"
+                "• !db — 데이터베이스 JSON 내보내기 (관리자 전용)\n\n"
+                "명령어를 채팅방에 입력하면 사용할 수 있어요."
             )
         elif stripped in {"!stats", "!stats group"}:
-            reply_parts.append(format_stats("현재 대화방 통계", await statistics(chat_id)))
+            raw_chat_id = field(source, "group_id", "groupId", "room_id", "roomId")
+            reply_parts.append(await format_stats(
+                "현재 대화방 통계", await statistics(chat_id), source_type, raw_chat_id, api
+            ))
             if stripped == "!stats":
-                reply_parts.append(format_stats("전체 통계", await statistics()))
+                reply_parts.append(await format_stats("전체 통계", await statistics(), "user", None, api))
         elif stripped == "!stats all":
             if is_admin:
-                reply_parts.append(format_stats("전체 통계", await statistics()))
+                reply_parts.append(await format_stats("전체 통계", await statistics(), "user", None, api))
             else:
-                reply_parts.append("이 명령어는 관리자만 사용할 수 있습니다.")
+                reply_parts.append("🔒 관리자 전용 명령어예요.\n이 기능은 관리자만 사용할 수 있어요.")
         elif stripped == "!stats me":
             if not user_id:
-                reply_parts.append("사용자 ID를 확인할 수 없습니다.")
+                reply_parts.append("사용자 정보를 확인할 수 없어 통계를 표시할 수 없어요.")
             else:
                 async with db_connect() as db:
                     row = await (await db.execute(
@@ -669,31 +627,61 @@ async def callback(request: Request):
                         "SELECT first_seen,last_seen FROM users WHERE user_id=?", (user_id,)
                     )).fetchone()
                 reply_parts.append(
-                    f"👤 내 통계\n누적 메시지: {row[0]}\n"
-                    f"최초 기록(UTC): {first['first_seen'] if first else '없음'}\n"
-                    f"최근 활동(UTC): {first['last_seen'] if first else '없음'}"
+                    "👤 내 활동 기록\n"
+                    "━━━━━━━━━━━━━━\n"
+                    f"💬 누적 메시지  {row[0]:,}개\n"
+                    f"🌱 첫 기록  {format_datetime(first['first_seen'] if first else None)}\n"
+                    f"🕒 최근 활동  {format_datetime(first['last_seen'] if first else None)}"
                 )
         elif stripped == "!mentions":
             if not user_id:
-                reply_parts.append("사용자 ID를 확인할 수 없습니다.")
+                reply_parts.append("사용자 정보를 확인할 수 없어 멘션 기록을 표시할 수 없어요.")
             else:
                 token, rows = await claim_pending_mentions(chat_id, user_id, MENTION_BATCH_LIMIT)
                 if rows:
-                    lines = ["📨 미전달 멘션 기록"]
+                    lines = ["📨 확인하지 못한 멘션", "━━━━━━━━━━━━━━"]
+                    raw_chat_id = field(source, "group_id", "groupId", "room_id", "roomId")
                     for row in rows:
-                        sender_name = await display_name_for(source_type, field(source, "group_id", "groupId", "room_id", "roomId"), row["sender_id"], api)
-                        lines.append(f"\n보낸 사람: {sender_name or row['sender_id']}\n원문: {row['original_text']}\n시각(UTC): {row['created_at']}")
+                        sender_name = await display_name_for(source_type, raw_chat_id, row["sender_id"], api)
+                        lines.append(
+                            f"\n👤 보낸 사람: {sender_name or row['sender_id']}"
+                            f"\n📝 메시지: {row['original_text']}"
+                            f"\n🕒 시간: {format_datetime(row['created_at'])}"
+                        )
                     reply_parts.append("\n".join(lines))
                     claim = (token, [r["id"] for r in rows])
                 else:
-                    reply_parts.append("현재 대화방에 미전달 멘션이 없습니다.")
+                    reply_parts.append("📭 현재 대화방에 확인하지 못한 멘션이 없어요.")
+        elif stripped == "!db":
+            if not is_admin:
+                reply_parts.append("🔒 관리자 전용 명령어예요.\n이 기능은 관리자만 사용할 수 있어요.")
+            else:
+                try:
+                    download_url = await create_database_export()
+                    reply_parts.append(
+                        "📦 데이터베이스 내보내기 완료\n"
+                        "━━━━━━━━━━━━━━\n"
+                        f"🔗 다운로드 링크\n{download_url}\n\n"
+                        f"⏳ 링크는 {EXPORT_TTL // 60}분 동안 유효해요.\n"
+                        "⚠️ 데이터가 포함된 링크이므로 다른 사람과 공유하지 마세요."
+                    )
+                except Exception:
+                    log.exception("DB JSON 내보내기 실패")
+                    reply_parts.append(
+                        "❌ 데이터베이스 내보내기에 실패했어요.\n"
+                        "잠시 후 다시 시도해 주세요.\n"
+                        "문제가 계속되면 관리자에게 문의해 주세요."
+                    )
+
+        if ECHO_MESSAGES and not stripped.startswith("!"):
+            reply_parts.insert(0, text)
 
         # On any ordinary user message, include a limited batch of pending mentions.
         if user_id and not stripped.startswith("!"):
             token, rows = await claim_pending_mentions(chat_id, user_id, MENTION_BATCH_LIMIT)
             if rows:
                 claim = (token, [r["id"] for r in rows])
-                lines = ["📨 이전 멘션 기록"]
+                lines = ["📨 이전 멘션 기록", "━━━━━━━━━━━━━━"]
                 for row in rows:
                     sender_name = await display_name_for(
                         source_type,
@@ -701,8 +689,9 @@ async def callback(request: Request):
                         row["sender_id"], api,
                     )
                     lines.append(
-                        f"\n보낸 사람: {sender_name or row['sender_id']}"
-                        f"\n원문: {row['original_text']}\n시각(UTC): {row['created_at']}"
+                        f"\n👤 보낸 사람: {sender_name or row['sender_id']}"
+                        f"\n📝 메시지: {row['original_text']}"
+                        f"\n🕒 시간: {format_datetime(row['created_at'])}"
                     )
                 reply_parts.append("\n".join(lines))
 
@@ -712,8 +701,8 @@ async def callback(request: Request):
         reply_text = "\n\n".join(reply_parts)[:MAX_REPLY_CHARS]
         try:
             await api.reply_message(ReplyMessageRequest(
-                reply_token=event.reply_token, # type: ignore
-                messages=[TextMessage(text=reply_text)], # type: ignore
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=reply_text)],
             ))
         except Exception:
             log.exception("Reply failed for chat=%s event=%s", chat_id, event_id)
