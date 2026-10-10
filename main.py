@@ -814,7 +814,7 @@ async def callback(request: Request):
                 "━━━━━━━━━━━━━━\n"
                 "• !도움말 — 명령어 목록 보기\n\n"
                 "📊 통계\n"
-                "• !통계 — 현재 대화방 및 전체 통계\n"
+                "• !통계 — 현재 대화방 통계\n"
                 "• !통계 대화방 — 현재 대화방 통계\n"
                 "• !통계 나 — 내 활동 기록\n"
                 "• !통계 전체 — 전체 통계 (관리자 전용)\n"
@@ -826,8 +826,10 @@ async def callback(request: Request):
                 "• !경고주의 — 경고 기준 도달 사용자 확인\n"
                 "• !소통미달 — 오늘 최소 소통량 미달 사용자 (관리자 전용)\n"
                 "• !소통미달 -1 — 어제 최소 소통량 미달 사용자\n\n"
-                "📨 멘션 기록\n"
-                "• !멘션 — 나에게 온 멘션·답장·전체 멘션 기록\n\n"
+                "📨 멘션·답장 알림\n"
+                "• 나를 멘션하거나 내 메시지에 답장하면, 내가 다음에 일반 채팅을 입력할 때 알림 내용이 자동으로 표시돼요.\n"
+                "• !멘션 — 자동 표시를 기다리지 않고 새 멘션·답장·전체 멘션 기록 확인\n"
+                "※ 명령어(!로 시작하는 메시지)는 자동 알림 표시를 실행하지 않아요.\n\n"
                 "🛠️ 관리 기능\n"
                 "• !데이터베이스 — 데이터베이스 JSON 내보내기 (관리자 전용)\n\n"
                 "명령어를 대화방에 입력하면 사용할 수 있어요.\n영문 명령어도 계속 사용할 수 있어요."
@@ -842,8 +844,6 @@ async def callback(request: Request):
                 reply_parts.append(await format_stats(
                     label, await statistics(chat_id, offset), source_type, raw_chat_id, api
                 ))
-                if command == "stats":
-                    reply_parts.append(await format_stats("전체 통계", await statistics(None, 0), "user", None, api))
         elif command == "stats all":
             if is_admin:
                 reply_parts.append(await format_stats("전체 통계", await statistics(), "user", None, api))
