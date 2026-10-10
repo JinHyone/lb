@@ -690,7 +690,7 @@ async def format_stats(title, stats, source_type=None, chat_raw_id=None, api=Non
         f"💬 누적 메시지  {stats['total']:,}개",
         f"📅 해당 날짜 메시지  {stats['day_count']:,}개",
         f"👥 해당 날짜 활동 사용자  {stats['users']:,}명",
-        f"🎯 그룹별 하루 최소 소통량: 🔭 {MALE_DAILY_MIN_MESSAGES:,}개 / 💫·📡 {FEMALE_DAILY_MIN_MESSAGES:,}개",
+        f"🎯 그룹별 하루 최소 소통량: 💫 {MALE_DAILY_MIN_MESSAGES:,}개 / 📡 {FEMALE_DAILY_MIN_MESSAGES:,}개",
         "",
         "🏆 해당 날짜 활동 TOP 10  (그룹별 달성 여부)",
     ]
@@ -997,9 +997,9 @@ async def callback(request: Request):
                 "• !소통설정 — 현재 기준 확인 (관리자 전용)\n"
                 "• !소통설정 남성기준 90 — 남성 기준 변경\n"
                 "• !소통설정 여성기준 70 — 여성 기준 변경\n"
-                "• !소통설정 남성이모티콘 🔭,🛰️ — 남성 이모티콘 그룹 변경\n"
-                "• !소통설정 여성이모티콘 💫,📡 — 여성 이모티콘 그룹 변경\n"
-                f"• 현재 기준 — 🔭 남성 {MALE_DAILY_MIN_MESSAGES}개 / 💫·📡 여성 {FEMALE_DAILY_MIN_MESSAGES}개\n\n"
+                "• !소통설정 남성이모티콘 🔭,💫 — 남성 이모티콘 그룹 변경\n"
+                "• !소통설정 여성이모티콘 🛰️,📡 — 여성 이모티콘 그룹 변경\n"
+                f"• 현재 기준 — 💫·🔭 남성 {MALE_DAILY_MIN_MESSAGES}개 / 📡 여성 {FEMALE_DAILY_MIN_MESSAGES}개\n\n"
                 "📨 멘션·답장 알림\n"
                 "• 나를 멘션하거나 내 메시지에 답장하면, 내가 다음에 일반 채팅을 입력할 때 알림 내용이 자동으로 표시돼요.\n"
                 "• !멘션 — 자동 표시를 기다리지 않고 새 멘션·답장·전체 멘션 기록 확인\n"
@@ -1008,10 +1008,7 @@ async def callback(request: Request):
                 "• !입퇴장 — 현재 대화방의 최근 입퇴장 기록\n"
                 "• !입퇴장 전체 — 현재 대화방의 최근 입퇴장 기록 목록\n"
                 "• !입퇴장 사용자ID 또는 !입퇴장 @사용자 — 해당 사용자의 최초 입장 시각, 마지막 퇴장 시각 및 기록 확인\n"
-                "※ 퇴장 시에만 대화방에 알림을 보내며, 입장 알림은 보내지 않아요.\n\n"
-                "🛠️ 관리 기능\n"
-                "• !데이터베이스 — 데이터베이스 JSON 내보내기 (관리자 전용)\n\n"
-                "명령어를 대화방에 입력하면 사용할 수 있어요.\n영문 명령어도 계속 사용할 수 있어요."
+                "※ 퇴장 시에만 대화방에 알림을 보내며, 입장 알림은 보내지 않아요."
             )
         elif command in {"stats", "stats group", "stats day"}:
             raw_chat_id = field(source, "group_id", "groupId", "room_id", "roomId")
@@ -1073,13 +1070,13 @@ async def callback(request: Request):
             elif not activity_settings_argument:
                 reply_parts.append(
                     "⚙️ 현재 소통 기준 설정\n━━━━━━━━━━━━━━\n"
-                    f"🔭 남성 이모티콘: {', '.join(MALE_GROUP_EMOJIS)}\n"
+                    f"💫 남성 이모티콘: {', '.join(MALE_GROUP_EMOJIS)}\n"
                     f"남성 하루 기준: {MALE_DAILY_MIN_MESSAGES}개\n\n"
-                    f"💫 여성 이모티콘: {', '.join(FEMALE_GROUP_EMOJIS)}\n"
+                    f"📡 여성 이모티콘: {', '.join(FEMALE_GROUP_EMOJIS)}\n"
                     f"여성 하루 기준: {FEMALE_DAILY_MIN_MESSAGES}개\n\n"
                     "변경 명령어:\n"
                     "!소통설정 남성기준 90\n!소통설정 여성기준 70\n"
-                    "!소통설정 남성이모티콘 🔭,🛰️\n!소통설정 여성이모티콘 💫,📡"
+                    "!소통설정 남성이모티콘 💫,🔭\n!소통설정 여성이모티콘 🛰️,📡"
                 )
             else:
                 parts = activity_settings_argument.split(maxsplit=1)
@@ -1140,7 +1137,7 @@ async def callback(request: Request):
                 title = f"📉 {selected_date} 소통량 미달 사용자"
                 lines = [
                     title, "━━━━━━━━━━━━━━",
-                    f"기준: 🔭 남성 {MALE_DAILY_MIN_MESSAGES:,}개 / 💫·📡 여성 {FEMALE_DAILY_MIN_MESSAGES:,}개 미만", ""
+                    f"기준: 💫 남성 {MALE_DAILY_MIN_MESSAGES:,}개 / 📡 여성 {FEMALE_DAILY_MIN_MESSAGES:,}개 미만", ""
                 ]
                 below_threshold = []
                 for row in rows:
