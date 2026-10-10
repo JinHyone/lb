@@ -630,7 +630,8 @@ async def callback(request: Request):
         claim = None
         is_admin = bool(user_id and user_id in ADMIN_USER_IDS)
 
-        if stripped == "!export_db":
+        if stripped == "!db":
+            reply_parts.append('db')
             try:
                 download_url = await create_database_export()
                 reply_parts.append(f"DB JSON 내보내기가 완료되었습니다.\n다운로드: {download_url}\n링크는 10분 후 만료됩니다.")
