@@ -274,15 +274,32 @@ class PGConnection:
             sql = sql.rstrip().rstrip(";") + " ON CONFLICT (event_id) DO NOTHING"
         return sql
 
+    
     async def execute(self, sql, params=()):
         sql = self._sql(sql.strip())
         upper = sql.lstrip().upper()
+        bound_params = tuple(params) if params else ()
+
         if upper.startswith(("SELECT", "WITH")) or " RETURNING " in upper:
-            rows = await self.conn.fetch(sql, *(tuple(params) if params else ()))
+            rows = await self.conn.fetch(sql, *bound_params)
             return PGCursor(rows, len(rows))
-        status = await self.conn.execute(sql, *(tuple(params) if params else ()))
-        match = re.search(r"(?:INSERT|UPDATE|DELETE|SELECT)\s+(\d+)$", status)
-        return PGCursor([], int(match.group(1)) if match else 0)
+
+        status = await self.conn.execute(sql, *bound_params)
+
+        # asyncpg status examples:
+        # INSERT 0 1  -> 1 row inserted
+        # INSERT 0 0  -> 0 rows inserted (e.g. ON CONFLICT DO NOTHING)
+        # UPDATE 3    -> 3 rows updated
+        # DELETE 2    -> 2 rows deleted
+        match = re.fullmatch(
+            r"(?:INSERT\s+\d+\s+(\d+)|UPDATE\s+(\d+)|DELETE\s+(\d+)|SELECT\s+(\d+))",
+            status.strip(),
+            flags=re.IGNORECASE,
+        )
+
+        rowcount = int(next(group for group in match.groups() if group is not None)) if match else 0
+        return PGCursor([], rowcount)
+
 
     async def commit(self):
         # Raw BEGIN transactions are committed through SQL in asyncpg.
@@ -718,9 +735,6 @@ async def callback(request: Request):
                         "잠시 후 다시 시도해 주세요.\n"
                         "문제가 계속되면 관리자에게 문의해 주세요."
                     )
-
-        if ECHO_MESSAGES and not stripped.startswith("!"):
-            reply_parts.insert(0, text)
 
         # On any ordinary user message, include a limited batch of pending mentions.
         if user_id and not stripped.startswith("!"):
