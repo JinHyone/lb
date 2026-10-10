@@ -274,32 +274,26 @@ class PGConnection:
             sql = sql.rstrip().rstrip(";") + " ON CONFLICT (event_id) DO NOTHING"
         return sql
 
-    
     async def execute(self, sql, params=()):
+        """Execute SQL while preserving the small cursor API used by this app."""
         sql = self._sql(sql.strip())
         upper = sql.lstrip().upper()
         bound_params = tuple(params) if params else ()
 
+        # Fetching rows directly supports SELECT and DML with RETURNING clauses.
         if upper.startswith(("SELECT", "WITH")) or " RETURNING " in upper:
             rows = await self.conn.fetch(sql, *bound_params)
             return PGCursor(rows, len(rows))
 
+        # asyncpg status strings look like "INSERT 0 1", "UPDATE 2", etc.
         status = await self.conn.execute(sql, *bound_params)
-
-        # asyncpg status examples:
-        # INSERT 0 1  -> 1 row inserted
-        # INSERT 0 0  -> 0 rows inserted (e.g. ON CONFLICT DO NOTHING)
-        # UPDATE 3    -> 3 rows updated
-        # DELETE 2    -> 2 rows deleted
         match = re.fullmatch(
             r"(?:INSERT\s+\d+\s+(\d+)|UPDATE\s+(\d+)|DELETE\s+(\d+)|SELECT\s+(\d+))",
             status.strip(),
             flags=re.IGNORECASE,
         )
-
-        rowcount = int(next(group for group in match.groups() if group is not None)) if match else 0
+        rowcount = int(next(value for value in match.groups() if value is not None)) if match else 0
         return PGCursor([], rowcount)
-
 
     async def commit(self):
         # Raw BEGIN transactions are committed through SQL in asyncpg.
@@ -424,8 +418,9 @@ async def claim_pending_mentions(chat_id: str, target_id: str, limit: int):
             # Recover claims stranded by a crashed worker. This is at-least-once, not exactly-once.
             await db.execute(
                 """UPDATE mentions SET status='pending', processing_token=NULL, processing_since=NULL
-                   WHERE status='processing' AND processing_since < ?""",
-                (stale_before,),
+                   WHERE status='processing' AND processing_since < ?
+                     AND chat_id=? AND target_id=?""",
+                (stale_before, chat_id, target_id),
             )
             rows = await (await db.execute(
                 """SELECT id,sender_id,original_text,created_at FROM mentions
@@ -466,23 +461,34 @@ async def finish_claim(mention_ids, token, delivered: bool):
 
 
 async def statistics(chat_id: str | None = None):
+    """Return aggregate counts and the five most active users with two queries."""
     local_now = datetime.now(ZoneInfo(TIMEZONE_NAME))
     local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
     start_utc = local_start.astimezone(timezone.utc).isoformat()
     end_utc = (local_start + timedelta(days=1)).astimezone(timezone.utc).isoformat()
+
+    where = " WHERE chat_id=?" if chat_id else ""
+    base_args = (chat_id,) if chat_id else ()
+    aggregate_sql = f"""SELECT
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE created_at >= ? AND created_at < ?) AS today,
+        COUNT(DISTINCT user_id) FILTER (WHERE user_id IS NOT NULL) AS users
+        FROM messages{where}"""
+    # Placeholders in SELECT expressions appear before the optional WHERE placeholder.
+    aggregate_args = (start_utc, end_utc, *base_args)
     async with db_connect() as db:
-        where = " WHERE chat_id=?" if chat_id else ""
-        args = (chat_id,) if chat_id else ()
-        total = (await (await db.execute(f"SELECT COUNT(*) FROM messages{where}", args)).fetchone())[0]
-        day_sql = f"SELECT COUNT(*) FROM messages{where}{' AND' if where else ' WHERE'} created_at >= ? AND created_at < ?"
-        today_count = (await (await db.execute(day_sql, (*args, start_utc, end_utc))).fetchone())[0]
-        user_sql = f"SELECT COUNT(DISTINCT user_id) FROM messages{where}{' AND' if where else ' WHERE'} user_id IS NOT NULL"
-        user_count = (await (await db.execute(user_sql, args)).fetchone())[0]
+        aggregate = await (await db.execute(aggregate_sql, aggregate_args)).fetchone()
         top_sql = f"""SELECT user_id, COUNT(*) AS count FROM messages{where}
-                       {'AND' if where else 'WHERE'} user_id IS NOT NULL
-                       GROUP BY user_id ORDER BY count DESC LIMIT 5"""
-        top = await (await db.execute(top_sql, args)).fetchall()
-        return {"total": total, "today": today_count, "users": user_count, "top": top}
+                      {'AND' if where else 'WHERE'} user_id IS NOT NULL
+                      GROUP BY user_id ORDER BY count DESC LIMIT 5"""
+        top = await (await db.execute(top_sql, base_args)).fetchall()
+
+    return {
+        "total": aggregate["total"],
+        "today": aggregate["today"],
+        "users": aggregate["users"],
+        "top": top,
+    }
 
 
 async def format_stats(title, stats, source_type=None, chat_raw_id=None, api=None):
@@ -509,9 +515,26 @@ async def format_stats(title, stats, source_type=None, chat_raw_id=None, api=Non
 
 
 async def display_name_for(source_type: str, chat_raw_id: str | None, user_id: str | None, api):
-    """Best-effort name lookup. Profile endpoints may fail due to membership/permission rules."""
+    """Return a cached display name, refreshing it at most once per day when possible."""
     if not user_id:
         return None
+
+    # Profile requests are comparatively slow and rate-limited; reuse a fresh DB value.
+    async with db_connect() as db:
+        cached = await (await db.execute(
+            "SELECT display_name, display_name_updated_at FROM users WHERE user_id=?",
+            (user_id,),
+        )).fetchone()
+    if cached and cached["display_name"] and cached["display_name_updated_at"]:
+        try:
+            updated_at = datetime.fromisoformat(cached["display_name_updated_at"])
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            if utc_now() - updated_at < timedelta(hours=24):
+                return cached["display_name"]
+        except (ValueError, TypeError):
+            pass
+
     try:
         if source_type == "group" and chat_raw_id:
             profile = await api.get_group_member_profile(chat_raw_id, user_id)
@@ -530,9 +553,7 @@ async def display_name_for(source_type: str, chat_raw_id: str | None, user_id: s
             return name
     except Exception as exc:
         log.debug("Profile lookup unavailable for %s: %s", user_id, exc)
-    async with db_connect() as db:
-        row = await (await db.execute("SELECT display_name FROM users WHERE user_id=?", (user_id,))).fetchone()
-        return row["display_name"] if row and row["display_name"] else None
+    return cached["display_name"] if cached and cached["display_name"] else None
 
 
 async def cleanup_old_data():
@@ -735,6 +756,9 @@ async def callback(request: Request):
                         "잠시 후 다시 시도해 주세요.\n"
                         "문제가 계속되면 관리자에게 문의해 주세요."
                     )
+
+        if ECHO_MESSAGES and not stripped.startswith("!"):
+            reply_parts.insert(0, text)
 
         # On any ordinary user message, include a limited batch of pending mentions.
         if user_id and not stripped.startswith("!"):
