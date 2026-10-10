@@ -49,8 +49,8 @@ def _parse_emoji_group(env_name: str, default: str) -> tuple[str, ...]:
     return values
 
 
-MALE_GROUP_EMOJIS = _parse_emoji_group("MALE_GROUP_EMOJIS", "🔭")
-FEMALE_GROUP_EMOJIS = _parse_emoji_group("FEMALE_GROUP_EMOJIS", "💫,📡")
+MALE_GROUP_EMOJIS = _parse_emoji_group("MALE_GROUP_EMOJIS", "🔭,💫")
+FEMALE_GROUP_EMOJIS = _parse_emoji_group("FEMALE_GROUP_EMOJIS", "📡")
 MALE_DAILY_MIN_MESSAGES = max(1, int(os.getenv("MALE_DAILY_MIN_MESSAGES", "80")))
 FEMALE_DAILY_MIN_MESSAGES = max(1, int(os.getenv("FEMALE_DAILY_MIN_MESSAGES", "60")))
 if set(MALE_GROUP_EMOJIS) & set(FEMALE_GROUP_EMOJIS):
