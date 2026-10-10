@@ -1007,7 +1007,7 @@ async def callback(request: Request):
                 "👥 입퇴장 기록 (관리자 전용)\n"
                 "• !입퇴장 — 현재 대화방의 최근 입퇴장 기록\n"
                 "• !입퇴장 전체 — 현재 대화방의 최근 입퇴장 기록 목록\n"
-                "• !입퇴장 사용자ID — 해당 사용자의 최초 입장 시각, 마지막 퇴장 시각 및 기록 확인\n"
+                "• !입퇴장 사용자ID 또는 !입퇴장 @사용자 — 해당 사용자의 최초 입장 시각, 마지막 퇴장 시각 및 기록 확인\n"
                 "※ 퇴장 시에만 대화방에 알림을 보내며, 입장 알림은 보내지 않아요.\n\n"
                 "🛠️ 관리 기능\n"
                 "• !데이터베이스 — 데이터베이스 JSON 내보내기 (관리자 전용)\n\n"
@@ -1247,27 +1247,35 @@ async def callback(request: Request):
                 match = re.fullmatch(r"!입퇴장(?:\s+(.+))?", stripped)
                 argument = (match.group(1).strip() if match and match.group(1) else "")
                 raw_chat_id = field(source, "group_id", "groupId", "room_id", "roomId")
-                target_id = None if not argument or argument == "전체" else argument
-                rows, first_join, last_left = await membership_history(chat_id, target_id, 30)
-                if target_id:
-                    name = await display_name_for(source_type, raw_chat_id, target_id, api)
-                    lines = [f"👤 사용자 입퇴장 기록: {name or target_id}", "━━━━━━━━━━━━━━",
-                             f"🆔 사용자 ID: {target_id}",
-                             f"🌱 최초 입장(봇 기록 기준): {format_datetime(first_join)}",
-                             f"👋 마지막 퇴장: {format_datetime(last_left)}", "", "최근 기록:"]
+                # !입퇴장 @사용자 형태를 지원한다. LINE의 mention 메타데이터에서
+                # 실제 user_id를 가져오므로 표시 이름이나 텍스트의 @문자에 의존하지 않는다.
+                if targets and len(targets) > 1 and argument and argument != "전체":
+                    reply_parts.append("한 번에 한 명만 멘션해 주세요. 예: !입퇴장 @사용자")
                 else:
-                    lines = ["👥 현재 대화방 최근 입퇴장 기록 (관리자 전용)", "━━━━━━━━━━━━━━", ""]
-                if not rows:
-                    lines.append("기록이 없어요. 봇이 입퇴장 이벤트를 받기 시작한 이후의 기록만 조회할 수 있어요.")
-                else:
-                    for row in rows:
-                        member_id = row["user_id"]
-                        member_name = await display_name_for(source_type, raw_chat_id, member_id, api)
-                        label = "입장" if row["event_type"] == "joined" else "퇴장"
-                        lines.append(f"• {format_datetime(row['occurred_at'])} — {label} — {member_name or member_id}\n  ID: {member_id}")
-                if not target_id:
-                    lines.append("\n특정 사용자 조회: !입퇴장 사용자ID")
-                reply_parts.append("\n".join(lines)[:MAX_REPLY_CHARS])
+                    if targets and argument and argument != "전체":
+                        target_id = targets[0]
+                    else:
+                        target_id = None if not argument or argument == "전체" else argument
+                    rows, first_join, last_left = await membership_history(chat_id, target_id, 30)
+                    if target_id:
+                        name = await display_name_for(source_type, raw_chat_id, target_id, api)
+                        lines = [f"👤 사용자 입퇴장 기록: {name or target_id}", "━━━━━━━━━━━━━━",
+                                 f"🆔 사용자 ID: {target_id}",
+                                 f"🌱 최초 입장(봇 기록 기준): {format_datetime(first_join)}",
+                                 f"👋 마지막 퇴장: {format_datetime(last_left)}", "", "최근 기록:"]
+                    else:
+                        lines = ["👥 현재 대화방 최근 입퇴장 기록 (관리자 전용)", "━━━━━━━━━━━━━━", ""]
+                    if not rows:
+                        lines.append("기록이 없어요. 봇이 입퇴장 이벤트를 받기 시작한 이후의 기록만 조회할 수 있어요.")
+                    else:
+                        for row in rows:
+                            member_id = row["user_id"]
+                            member_name = await display_name_for(source_type, raw_chat_id, member_id, api)
+                            label = "입장" if row["event_type"] == "joined" else "퇴장"
+                            lines.append(f"• {format_datetime(row['occurred_at'])} — {label} — {member_name or member_id}\n  ID: {member_id}")
+                    if not target_id:
+                        lines.append("\n특정 사용자 조회: !입퇴장 사용자ID 또는 !입퇴장 @사용자")
+                    reply_parts.append("\n".join(lines)[:MAX_REPLY_CHARS])
         elif command == "db":
             if not is_admin:
                 reply_parts.append("🔒 관리자 전용 명령어예요.\n이 기능은 관리자만 사용할 수 있어요.")
