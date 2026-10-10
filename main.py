@@ -830,9 +830,6 @@ async def callback(request: Request):
                 "• 나를 멘션하거나 내 메시지에 답장하면, 내가 다음에 일반 채팅을 입력할 때 알림 내용이 자동으로 표시돼요.\n"
                 "• !멘션 — 자동 표시를 기다리지 않고 새 멘션·답장·전체 멘션 기록 확인\n"
                 "※ 명령어(!로 시작하는 메시지)는 자동 알림 표시를 실행하지 않아요.\n\n"
-                "🛠️ 관리 기능\n"
-                "• !데이터베이스 — 데이터베이스 JSON 내보내기 (관리자 전용)\n\n"
-                "명령어를 대화방에 입력하면 사용할 수 있어요.\n영문 명령어도 계속 사용할 수 있어요."
             )
         elif command in {"stats", "stats group", "stats day"}:
             raw_chat_id = field(source, "group_id", "groupId", "room_id", "roomId")
