@@ -8,10 +8,14 @@ import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import json
+import secrets
 from zoneinfo import ZoneInfo
+import time
 
-import aiosqlite
+import aiosqlite # pyright: ignore[reportMissingImports]
 from dotenv import load_dotenv
+from fastapi.responses import FileResponse
 from fastapi import FastAPI, HTTPException, Request
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
@@ -420,6 +424,151 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="LINE Community Bot", version="1.0.0", lifespan=lifespan)
 
+# JSON 내보내기 파일 임시 저장 위치
+EXPORT_DIR = Path("/tmp/line_bot_exports")
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+# 다운로드 링크 유효 시간: 10분
+EXPORT_TTL = 600
+
+# 발급된 다운로드 토큰: {token: (파일 경로, 만료 시각)}
+export_tokens = {}
+
+# Render 환경변수에 실제 서비스 주소를 설정
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+
+def cleanup_expired_exports():
+    """만료된 내보내기 파일과 토큰 정리."""
+    now = time.time()
+
+    for token, (file_path, expires_at) in list(export_tokens.items()):
+        if now >= expires_at:
+            export_tokens.pop(token, None)
+
+            try:
+                Path(file_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def export_database_to_json(output_path: Path):
+    """SQLite의 모든 일반 테이블을 JSON 파일로 내보낸다."""
+
+    # 기존 프로젝트의 DB 경로 변수에 맞춰 사용
+    db_path = Path(os.getenv("DATABASE_PATH", str(DB_PATH)))
+
+    if not db_path.is_file():
+        raise FileNotFoundError(
+            f"데이터베이스 파일을 찾을 수 없습니다: {db_path}"
+        )
+
+    # 읽기 전용 연결로 데이터베이스 조회
+    connection = sqlite3.connect(
+        f"{db_path.resolve().as_uri()}?mode=ro",
+        uri=True,
+        timeout=10,
+    )
+    connection.row_factory = sqlite3.Row
+
+    try:
+        tables = connection.execute("""
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name NOT LIKE 'sqlite_%'
+            ORDER BY name
+        """).fetchall()
+
+        result = {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "tables": {},
+        }
+
+        for table_row in tables:
+            table_name = table_row["name"]
+
+            # 테이블 이름은 SQLite 메타데이터에서 가져오므로
+            # 식별자 인용 시 큰따옴표를 이스케이프한다.
+            quoted_name = '"' + table_name.replace('"', '""') + '"'
+
+            rows = connection.execute(
+                f"SELECT * FROM {quoted_name}"
+            ).fetchall()
+
+            result["tables"][table_name] = [
+                dict(row) for row in rows
+            ]
+
+        with output_path.open("w", encoding="utf-8") as file:
+            json.dump(
+                result,
+                file,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+
+    finally:
+        connection.close()
+
+
+async def create_database_export():
+    """DB JSON 파일을 만들고 만료되는 다운로드 URL을 반환한다."""
+    cleanup_expired_exports()
+
+    if not PUBLIC_BASE_URL:
+        raise RuntimeError(
+            "PUBLIC_BASE_URL 환경변수가 설정되지 않았습니다."
+        )
+
+    token = secrets.token_urlsafe(32)
+    file_path = EXPORT_DIR / f"database_{token}.json"
+
+    try:
+        await asyncio.to_thread(
+            export_database_to_json,
+            file_path,
+        )
+
+        export_tokens[token] = (
+            str(file_path),
+            time.time() + EXPORT_TTL,
+        )
+
+        return f"{PUBLIC_BASE_URL}/exports/{token}"
+
+    except Exception:
+        file_path.unlink(missing_ok=True)
+        raise
+
+
+@app.get("/exports/{token}")
+async def download_database_export(token: str):
+    """토큰이 유효한 경우에만 JSON 파일을 다운로드한다."""
+    cleanup_expired_exports()
+
+    export = export_tokens.get(token)
+
+    if export is None:
+        raise HTTPException(
+            status_code=404,
+            detail="다운로드 링크가 만료되었거나 유효하지 않습니다.",
+        )
+
+    file_path, expires_at = export
+
+    if time.time() >= expires_at or not Path(file_path).is_file():
+        export_tokens.pop(token, None)
+        raise HTTPException(status_code=404, detail="파일이 만료되었습니다.")
+
+    return FileResponse(
+        path=file_path,
+        media_type="application/json",
+        filename="line_bot_database.json",
+        background=None,
+    )
+
 
 @app.get("/")
 async def health():
@@ -448,7 +597,7 @@ async def callback(request: Request):
         raise HTTPException(status_code=400, detail="Invalid webhook payload")
 
     api = request.app.state.line_api
-    for event in events:
+    for event in events: # type: ignore
         if not isinstance(event, MessageEvent):
             continue
         source = event.source
@@ -461,14 +610,18 @@ async def callback(request: Request):
         text = field(message, "text") if message_type == "text" else None
         event_id = field(event, "webhook_event_id", "webhookEventId")
         targets, unresolved = mention_targets(message) if message_type == "text" else ([], 0)
+        
         try:
             result = await record_event(event_id, user_id, chat_id, message_type, text, targets, unresolved)
+        
         except Exception:
             log.exception("Database event processing failed")
             # Non-2xx encourages LINE retry. Idempotency prevents duplicate DB rows on retry.
             raise HTTPException(status_code=500, detail="Event persistence failed")
+        
         if result is None:
             continue
+        
         if message_type != "text" or not text:
             continue
 
@@ -476,6 +629,19 @@ async def callback(request: Request):
         reply_parts: list[str] = []
         claim = None
         is_admin = bool(user_id and user_id in ADMIN_USER_IDS)
+
+        if stripped == "!export_db":
+            try:
+                download_url = await create_database_export()
+                reply_parts.append(f"DB JSON 내보내기가 완료되었습니다.\n다운로드: {download_url}\n링크는 10분 후 만료됩니다.")
+
+            except Exception:
+                # 실제 오류 내용이나 DB 경로는 채팅에 노출하지 않는다.
+                print("DB JSON 내보내기 실패")
+
+                reply_parts.append("DB 내보내기에 실패했습니다. 서버 로그를 확인해 주세요.")
+
+            return
 
         # Commands: !help, !stats, !stats all, !stats group, !stats me, !mentions
         if stripped == "!help":
@@ -551,8 +717,8 @@ async def callback(request: Request):
         reply_text = "\n\n".join(reply_parts)[:MAX_REPLY_CHARS]
         try:
             await api.reply_message(ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)],
+                reply_token=event.reply_token, # type: ignore
+                messages=[TextMessage(text=reply_text)], # type: ignore
             ))
         except Exception:
             log.exception("Reply failed for chat=%s event=%s", chat_id, event_id)
