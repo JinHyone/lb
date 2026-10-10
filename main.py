@@ -635,10 +635,9 @@ async def callback(request: Request):
                 download_url = await create_database_export()
                 reply_parts.append(f"DB JSON 내보내기가 완료되었습니다.\n다운로드: {download_url}\n링크는 10분 후 만료됩니다.")
 
-            except Exception:
+            except Exception as e:
                 # 실제 오류 내용이나 DB 경로는 채팅에 노출하지 않는다.
-                print("DB JSON 내보내기 실패")
-
+                print(f"DB JSON 내보내기 실패\n{e}")
                 reply_parts.append("DB 내보내기에 실패했습니다. 서버 로그를 확인해 주세요.")
 
             return
@@ -689,9 +688,6 @@ async def callback(request: Request):
                     claim = (token, [r["id"] for r in rows])
                 else:
                     reply_parts.append("현재 대화방에 미전달 멘션이 없습니다.")
-
-        if ECHO_MESSAGES and not stripped.startswith("!"):
-            reply_parts.insert(0, text)
 
         # On any ordinary user message, include a limited batch of pending mentions.
         if user_id and not stripped.startswith("!"):
