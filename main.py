@@ -148,17 +148,27 @@ CREATE TABLE IF NOT EXISTS bot_metadata (
 """
 
 
-async def db_connect() -> aiosqlite.Connection:
+@asynccontextmanager
+async def db_connect():
+    """Open one aiosqlite connection and always close it exactly once.
+
+    Do not await aiosqlite.connect() and then enter that same connection with
+    ``async with``: aiosqlite's connection context manager starts its worker
+    thread on entry, so doing both raises ``threads can only be started once``.
+    """
     db = await aiosqlite.connect(DB_PATH, timeout=10)
-    db.row_factory = aiosqlite.Row
-    await db.execute("PRAGMA busy_timeout=10000")
-    await db.execute("PRAGMA foreign_keys=ON")
-    return db
+    try:
+        db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA busy_timeout=10000")
+        await db.execute("PRAGMA foreign_keys=ON")
+        yield db
+    finally:
+        await db.close()
 
 
 async def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    async with await db_connect() as db:
+    async with db_connect() as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.executescript(SCHEMA)
         # Lightweight additive migration for databases created by earlier drafts.
@@ -210,7 +220,7 @@ async def init_db():
 
 async def record_event(event_id, user_id, chat_id, message_type, message_text, targets, unresolved):
     now = iso_now()
-    async with await db_connect() as db:
+    async with db_connect() as db:
         await db.execute("BEGIN IMMEDIATE")
         try:
             if event_id:
@@ -265,7 +275,7 @@ async def claim_pending_mentions(chat_id: str, target_id: str, limit: int):
     token = os.urandom(16).hex()
     now = iso_now()
     stale_before = (utc_now() - timedelta(minutes=3)).isoformat()
-    async with await db_connect() as db:
+    async with db_connect() as db:
         await db.execute("BEGIN IMMEDIATE")
         try:
             # Recover claims stranded by a crashed worker. This is at-least-once, not exactly-once.
@@ -307,7 +317,7 @@ async def finish_claim(mention_ids, token, delivered: bool):
         sql = f"""UPDATE mentions SET status='pending', processing_token=NULL, processing_since=NULL
                    WHERE id IN ({marks}) AND status='processing' AND processing_token=?"""
         params = (*mention_ids, token)
-    async with await db_connect() as db:
+    async with db_connect() as db:
         await db.execute(sql, params)
         await db.commit()
 
@@ -317,7 +327,7 @@ async def statistics(chat_id: str | None = None):
     local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
     start_utc = local_start.astimezone(timezone.utc).isoformat()
     end_utc = (local_start + timedelta(days=1)).astimezone(timezone.utc).isoformat()
-    async with await db_connect() as db:
+    async with db_connect() as db:
         where = " WHERE chat_id=?" if chat_id else ""
         args = (chat_id,) if chat_id else ()
         total = (await (await db.execute(f"SELECT COUNT(*) FROM messages{where}", args)).fetchone())[0]
@@ -355,7 +365,7 @@ async def display_name_for(source_type: str, chat_raw_id: str | None, user_id: s
             profile = await api.get_profile(user_id)
         name = field(profile, "display_name", "displayName")
         if name:
-            async with await db_connect() as db:
+            async with db_connect() as db:
                 await db.execute(
                     "UPDATE users SET display_name=?, display_name_updated_at=? WHERE user_id=?",
                     (name, iso_now(), user_id),
@@ -364,7 +374,7 @@ async def display_name_for(source_type: str, chat_raw_id: str | None, user_id: s
             return name
     except Exception as exc:
         log.debug("Profile lookup unavailable for %s: %s", user_id, exc)
-    async with await db_connect() as db:
+    async with db_connect() as db:
         row = await (await db.execute("SELECT display_name FROM users WHERE user_id=?", (user_id,))).fetchone()
         return row["display_name"] if row and row["display_name"] else None
 
@@ -374,7 +384,7 @@ async def cleanup_old_data():
     if RETENTION_DAYS <= 0:
         return
     cutoff = (utc_now() - timedelta(days=RETENTION_DAYS)).isoformat()
-    async with await db_connect() as db:
+    async with db_connect() as db:
         # Keep aggregate user counts, but delete detailed message history after retention.
         await db.execute("DELETE FROM messages WHERE created_at < ?", (cutoff,))
         await db.execute("DELETE FROM mentions WHERE created_at < ? AND status IN ('delivered','unresolved')", (cutoff,))
@@ -418,7 +428,7 @@ async def health():
 
 @app.get("/health/db")
 async def health_db():
-    async with await db_connect() as db:
+    async with db_connect() as db:
         await (await db.execute("SELECT 1")).fetchone()
     return {"status": "ok", "database": "ok"}
 
@@ -487,7 +497,7 @@ async def callback(request: Request):
             if not user_id:
                 reply_parts.append("사용자 ID를 확인할 수 없습니다.")
             else:
-                async with await db_connect() as db:
+                async with db_connect() as db:
                     row = await (await db.execute(
                         "SELECT COUNT(*) FROM messages WHERE user_id=?", (user_id,)
                     )).fetchone()
@@ -513,6 +523,9 @@ async def callback(request: Request):
                     claim = (token, [r["id"] for r in rows])
                 else:
                     reply_parts.append("현재 대화방에 미전달 멘션이 없습니다.")
+
+        if ECHO_MESSAGES and not stripped.startswith("!"):
+            reply_parts.insert(0, text)
 
         # On any ordinary user message, include a limited batch of pending mentions.
         if user_id and not stripped.startswith("!"):
