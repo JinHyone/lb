@@ -53,9 +53,6 @@ MALE_GROUP_EMOJIS = _parse_emoji_group("MALE_GROUP_EMOJIS", "🔭")
 FEMALE_GROUP_EMOJIS = _parse_emoji_group("FEMALE_GROUP_EMOJIS", "💫,📡")
 MALE_DAILY_MIN_MESSAGES = max(1, int(os.getenv("MALE_DAILY_MIN_MESSAGES", "80")))
 FEMALE_DAILY_MIN_MESSAGES = max(1, int(os.getenv("FEMALE_DAILY_MIN_MESSAGES", "60")))
-UNKNOWN_DAILY_MIN_MESSAGES = max(1, int(os.getenv("UNKNOWN_DAILY_MIN_MESSAGES", "78")))
-# 하위 호환용 별칭. 그룹 판정에는 사용하지 않는다.
-DAILY_MIN_MESSAGES = UNKNOWN_DAILY_MIN_MESSAGES
 if set(MALE_GROUP_EMOJIS) & set(FEMALE_GROUP_EMOJIS):
     overlap = ", ".join(sorted(set(MALE_GROUP_EMOJIS) & set(FEMALE_GROUP_EMOJIS)))
     raise RuntimeError(f"남성/여성 이모티콘 설정이 중복됩니다: {overlap}. 환경변수를 확인해 주세요.")
@@ -128,11 +125,10 @@ def format_datetime(value: str | None) -> str:
         return str(value)
 
 
-def classify_user_group(display_name: str | None) -> tuple[str, int]:
-    """프로필 표시 이름의 등록 이모티콘으로 그룹과 하루 최소 메시지 수를 결정한다.
+def classify_user_group(display_name: str | None) -> tuple[str, int] | None:
+    """등록된 남성/여성 이모티콘이 명확히 일치할 때만 그룹과 기준을 반환한다.
 
-    등록 이모티콘이 없거나, 이름에 남성/여성 그룹 이모티콘이 모두 있거나,
-    프로필 이름을 확인할 수 없으면 미분류 기준을 적용한다.
+    어느 그룹에도 속하지 않거나 두 그룹 이모티콘이 모두 있으면 소통량 판정에서 제외한다.
     """
     name = display_name or ""
     male_match = any(emoji in name for emoji in MALE_GROUP_EMOJIS)
@@ -141,11 +137,12 @@ def classify_user_group(display_name: str | None) -> tuple[str, int]:
         return "남성", MALE_DAILY_MIN_MESSAGES
     if female_match and not male_match:
         return "여성", FEMALE_DAILY_MIN_MESSAGES
-    return "미분류", UNKNOWN_DAILY_MIN_MESSAGES
+    return None
 
 
-def minimum_messages_for_name(display_name: str | None) -> int:
-    return classify_user_group(display_name)[1]
+def minimum_messages_for_name(display_name: str | None) -> int | None:
+    classification = classify_user_group(display_name)
+    return classification[1] if classification else None
 
 
 def cleanup_expired_exports() -> None:
@@ -440,7 +437,7 @@ async def init_db():
             settings = await conn.fetch("SELECT key, value FROM bot_metadata WHERE key LIKE 'activity_%'")
             loaded = {row["key"]: row["value"] for row in settings}
             global MALE_GROUP_EMOJIS, FEMALE_GROUP_EMOJIS
-            global MALE_DAILY_MIN_MESSAGES, FEMALE_DAILY_MIN_MESSAGES, UNKNOWN_DAILY_MIN_MESSAGES, DAILY_MIN_MESSAGES
+            global MALE_DAILY_MIN_MESSAGES, FEMALE_DAILY_MIN_MESSAGES
             if "activity_male_emojis" in loaded:
                 MALE_GROUP_EMOJIS = tuple(json.loads(loaded["activity_male_emojis"]))
             if "activity_female_emojis" in loaded:
@@ -451,9 +448,6 @@ async def init_db():
                 MALE_DAILY_MIN_MESSAGES = max(1, int(loaded["activity_male_min"]))
             if "activity_female_min" in loaded:
                 FEMALE_DAILY_MIN_MESSAGES = max(1, int(loaded["activity_female_min"]))
-            if "activity_unknown_min" in loaded:
-                UNKNOWN_DAILY_MIN_MESSAGES = max(1, int(loaded["activity_unknown_min"]))
-            DAILY_MIN_MESSAGES = UNKNOWN_DAILY_MIN_MESSAGES
     except Exception:
         await db_pool.close()
         db_pool = None
@@ -696,7 +690,7 @@ async def format_stats(title, stats, source_type=None, chat_raw_id=None, api=Non
         f"💬 누적 메시지  {stats['total']:,}개",
         f"📅 해당 날짜 메시지  {stats['day_count']:,}개",
         f"👥 해당 날짜 활동 사용자  {stats['users']:,}명",
-        f"🎯 그룹별 하루 최소 소통량: 🔭 {MALE_DAILY_MIN_MESSAGES:,}개 / 💫·📡 {FEMALE_DAILY_MIN_MESSAGES:,}개 / 기타 {UNKNOWN_DAILY_MIN_MESSAGES:,}개",
+        f"🎯 그룹별 하루 최소 소통량: 🔭 {MALE_DAILY_MIN_MESSAGES:,}개 / 💫·📡 {FEMALE_DAILY_MIN_MESSAGES:,}개",
         "",
         "🏆 해당 날짜 활동 TOP 10  (그룹별 달성 여부)",
     ]
@@ -709,13 +703,17 @@ async def format_stats(title, stats, source_type=None, chat_raw_id=None, api=Non
             name = None
             if api is not None:
                 name = await display_name_for(source_type or "user", chat_raw_id, user_id, api)
-            group_name, threshold = classify_user_group(name)
-            achieved = "달성" if int(row["count"]) >= threshold else "미달성"
+            classification = classify_user_group(name)
             medal = medals[i] if i < len(medals) else f"{i + 1}."
-            lines.append(
-                f"{medal} {name or user_id}  ·  {row['count']:,}개 / {threshold:,}개 "
-                f"({group_name} · {achieved})"
-            )
+            if classification is None:
+                lines.append(f"{medal} {name or user_id}  ·  {row['count']:,}개 (그룹 미지정 · 판정 제외)")
+            else:
+                group_name, threshold = classification
+                achieved = "달성" if int(row["count"]) >= threshold else "미달성"
+                lines.append(
+                    f"{medal} {name or user_id}  ·  {row['count']:,}개 / {threshold:,}개 "
+                    f"({group_name} · {achieved})"
+                )
     return "\n".join(lines)
 
 
@@ -999,10 +997,9 @@ async def callback(request: Request):
                 "• !소통설정 — 현재 기준 확인 (관리자 전용)\n"
                 "• !소통설정 남성기준 90 — 남성 기준 변경\n"
                 "• !소통설정 여성기준 70 — 여성 기준 변경\n"
-                "• !소통설정 기타기준 78 — 미분류 기준 변경\n"
                 "• !소통설정 남성이모티콘 🔭,🛰️ — 남성 이모티콘 그룹 변경\n"
                 "• !소통설정 여성이모티콘 💫,📡 — 여성 이모티콘 그룹 변경\n"
-                f"• 현재 기준 — 🔭 남성 {MALE_DAILY_MIN_MESSAGES}개 / 💫·📡 여성 {FEMALE_DAILY_MIN_MESSAGES}개 / 기타 {UNKNOWN_DAILY_MIN_MESSAGES}개\n\n"
+                f"• 현재 기준 — 🔭 남성 {MALE_DAILY_MIN_MESSAGES}개 / 💫·📡 여성 {FEMALE_DAILY_MIN_MESSAGES}개\n\n"
                 "📨 멘션·답장 알림\n"
                 "• 나를 멘션하거나 내 메시지에 답장하면, 내가 다음에 일반 채팅을 입력할 때 알림 내용이 자동으로 표시돼요.\n"
                 "• !멘션 — 자동 표시를 기다리지 않고 새 멘션·답장·전체 멘션 기록 확인\n"
@@ -1080,9 +1077,8 @@ async def callback(request: Request):
                     f"남성 하루 기준: {MALE_DAILY_MIN_MESSAGES}개\n\n"
                     f"💫 여성 이모티콘: {', '.join(FEMALE_GROUP_EMOJIS)}\n"
                     f"여성 하루 기준: {FEMALE_DAILY_MIN_MESSAGES}개\n\n"
-                    f"기타/확인 불가 기준: {UNKNOWN_DAILY_MIN_MESSAGES}개\n\n"
                     "변경 명령어:\n"
-                    "!소통설정 남성기준 90\n!소통설정 여성기준 70\n!소통설정 기타기준 78\n"
+                    "!소통설정 남성기준 90\n!소통설정 여성기준 70\n"
                     "!소통설정 남성이모티콘 🔭,🛰️\n!소통설정 여성이모티콘 💫,📡"
                 )
             else:
@@ -1092,7 +1088,6 @@ async def callback(request: Request):
                 key_map = {
                     "남성기준": ("activity_male_min", "male_min"),
                     "여성기준": ("activity_female_min", "female_min"),
-                    "기타기준": ("activity_unknown_min", "unknown_min"),
                     "남성이모티콘": ("activity_male_emojis", "male_emojis"),
                     "여성이모티콘": ("activity_female_emojis", "female_emojis"),
                 }
@@ -1124,9 +1119,6 @@ async def callback(request: Request):
                             globals()["MALE_DAILY_MIN_MESSAGES"] = new_value
                         elif kind == "female_min":
                             globals()["FEMALE_DAILY_MIN_MESSAGES"] = new_value
-                        elif kind == "unknown_min":
-                            globals()["UNKNOWN_DAILY_MIN_MESSAGES"] = new_value
-                            globals()["DAILY_MIN_MESSAGES"] = new_value
                         elif kind == "male_emojis":
                             globals()["MALE_GROUP_EMOJIS"] = new_value
                         elif kind == "female_emojis":
@@ -1148,12 +1140,15 @@ async def callback(request: Request):
                 title = f"📉 {selected_date} 소통량 미달 사용자"
                 lines = [
                     title, "━━━━━━━━━━━━━━",
-                    f"기준: 🔭 남성 {MALE_DAILY_MIN_MESSAGES:,}개 / 💫·📡 여성 {FEMALE_DAILY_MIN_MESSAGES:,}개 / 기타 {UNKNOWN_DAILY_MIN_MESSAGES:,}개 미만", ""
+                    f"기준: 🔭 남성 {MALE_DAILY_MIN_MESSAGES:,}개 / 💫·📡 여성 {FEMALE_DAILY_MIN_MESSAGES:,}개 미만", ""
                 ]
                 below_threshold = []
                 for row in rows:
                     name = await display_name_for(source_type, raw_chat_id, row["user_id"], api)
-                    group_name, threshold = classify_user_group(name)
+                    classification = classify_user_group(name)
+                    if classification is None:
+                        continue
+                    group_name, threshold = classification
                     count = int(row["day_count"])
                     if count < threshold:
                         below_threshold.append((row, name, group_name, threshold, count))
