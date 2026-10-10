@@ -4,7 +4,6 @@ import asyncio
 import logging
 import os
 import re
-import sqlite3
 import json
 import secrets
 import time
@@ -12,8 +11,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-import aiosqlite
+import asyncpg
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -31,7 +31,10 @@ from linebot.v3.webhooks import MessageEvent
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = Path(os.getenv("DATABASE_PATH", str(BASE_DIR / "bot.db")))
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_POOL_MIN = max(1, int(os.getenv("DB_POOL_MIN", "1")))
+DB_POOL_MAX = max(DB_POOL_MIN, int(os.getenv("DB_POOL_MAX", "5")))
+db_pool: asyncpg.Pool | None = None
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 ADMIN_USER_IDS = {x.strip() for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()}
@@ -57,6 +60,18 @@ if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 parser = WebhookParser(CHANNEL_SECRET)
 
+
+
+def asyncpg_connection_args(dsn: str) -> tuple[str, str | None]:
+    """Normalize Neon/libpq URLs for asyncpg and require TLS for remote DBs."""
+    parts = urlsplit(dsn)
+    local = parts.hostname in {"localhost", "127.0.0.1", "::1"}
+    # SSL is passed as an asyncpg option below; remove libpq-only URL switches
+    # to avoid duplicate/unsupported keyword arguments in some asyncpg versions.
+    query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+             if key.lower() not in {"sslmode", "channel_binding"}]
+    normalized = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+    return normalized, (None if local else "require")
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -97,32 +112,30 @@ def cleanup_expired_exports() -> None:
                 log.warning("오래된 내보내기 파일 정리 실패: %s", path)
 
 
-def export_database_to_json(output_path: Path) -> None:
-    """SQLite 데이터베이스의 테이블을 JSON으로 내보낸다."""
-    connection = sqlite3.connect(str(DB_PATH), timeout=10)
-    connection.row_factory = sqlite3.Row
-    try:
-        connection.execute("PRAGMA busy_timeout=10000")
-        table_names = [
-            row[0] for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-            ).fetchall()
-        ]
+async def export_database_to_json(output_path: Path) -> None:
+    """PostgreSQL의 공개 테이블을 JSON으로 내보낸다."""
+    if db_pool is None:
+        raise RuntimeError("데이터베이스 풀이 아직 초기화되지 않았습니다.")
+    async with db_pool.acquire() as conn:
+        table_rows = await conn.fetch("""
+            SELECT tablename FROM pg_tables
+            WHERE schemaname = 'public' AND tablename NOT LIKE 'pg_%'
+            ORDER BY tablename
+        """)
         result = {
             "exported_at": datetime.now(ZoneInfo(TIMEZONE_NAME)).isoformat(),
-            "database": DB_PATH.name,
+            "database": "postgresql",
             "tables": {},
         }
-        for table_name in table_names:
-            # Table names come from sqlite_master and are quoted as identifiers.
-            escaped_name = table_name.replace('"', '""')
-            rows = connection.execute(f'SELECT * FROM "{escaped_name}"').fetchall()
+        for item in table_rows:
+            table_name = item["tablename"]
+            # 테이블명은 PostgreSQL 시스템 카탈로그에서 얻은 값만 사용한다.
+            safe_name = table_name.replace('"', '""')
+            rows = await conn.fetch(f'SELECT * FROM "{safe_name}"')
             result["tables"][table_name] = [dict(row) for row in rows]
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_path.open("w", encoding="utf-8") as file:
-            json.dump(result, file, ensure_ascii=False, indent=2, default=str)
-    finally:
-        connection.close()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as file:
+        json.dump(result, file, ensure_ascii=False, indent=2, default=str)
 
 
 async def create_database_export() -> str:
@@ -132,7 +145,7 @@ async def create_database_export() -> str:
     token = secrets.token_urlsafe(32)
     file_path = EXPORT_DIR / f"database_{token}.json"
     try:
-        await asyncio.to_thread(export_database_to_json, file_path)
+        await export_database_to_json(file_path)
         export_tokens[token] = (str(file_path), time.time() + EXPORT_TTL)
         return f"{PUBLIC_BASE_URL}/exports/{token}"
     except Exception:
@@ -195,7 +208,7 @@ CREATE TABLE IF NOT EXISTS users (
   display_name_updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
   event_id TEXT UNIQUE,
   user_id TEXT,
   chat_id TEXT NOT NULL,
@@ -206,7 +219,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_user_time ON messages(user_id, created_at);
 CREATE TABLE IF NOT EXISTS mentions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
   event_id TEXT,
   chat_id TEXT NOT NULL,
   sender_id TEXT NOT NULL,
@@ -230,80 +243,111 @@ CREATE TABLE IF NOT EXISTS bot_metadata (
 """
 
 
+class PGCursor:
+    """기존 DB 호출부와 호환되는 최소 커서 인터페이스를 제공한다."""
+    def __init__(self, rows=None, rowcount=0):
+        self._rows = rows or []
+        self.rowcount = rowcount
+
+    async def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    async def fetchall(self):
+        return self._rows
+
+
+class PGConnection:
+    def __init__(self, conn):
+        self.conn = conn
+
+    @staticmethod
+    def _sql(sql: str) -> str:
+        # 이 프로젝트의 SQL에는 물음표가 매개변수 자리표시자로만 사용된다.
+        index = 0
+        def replace(_match):
+            nonlocal index
+            index += 1
+            return f"${index}"
+        sql = re.sub(r"\?", replace, sql)
+        sql = re.sub(r"INSERT OR IGNORE INTO", "INSERT INTO", sql, flags=re.IGNORECASE)
+        if re.search(r"INSERT INTO processed_events\s*\(", sql, flags=re.IGNORECASE) and "ON CONFLICT" not in sql.upper():
+            sql = sql.rstrip().rstrip(";") + " ON CONFLICT (event_id) DO NOTHING"
+        return sql
+
+    async def execute(self, sql, params=()):
+        sql = self._sql(sql.strip())
+        upper = sql.lstrip().upper()
+        if upper.startswith(("SELECT", "WITH")) or " RETURNING " in upper:
+            rows = await self.conn.fetch(sql, *(tuple(params) if params else ()))
+            return PGCursor(rows, len(rows))
+        status = await self.conn.execute(sql, *(tuple(params) if params else ()))
+        match = re.search(r"(?:INSERT|UPDATE|DELETE|SELECT)\s+(\d+)$", status)
+        return PGCursor([], int(match.group(1)) if match else 0)
+
+    async def commit(self):
+        # Raw BEGIN transactions are committed through SQL in asyncpg.
+        await self.conn.execute("COMMIT")
+
+    async def rollback(self):
+        await self.conn.execute("ROLLBACK")
+
+
 @asynccontextmanager
 async def db_connect():
-    """Open one aiosqlite connection and always close it exactly once.
-
-    Do not await aiosqlite.connect() and then enter that same connection with
-    ``async with``: aiosqlite's connection context manager starts its worker
-    thread on entry, so doing both raises ``threads can only be started once``.
-    """
-    db = await aiosqlite.connect(DB_PATH, timeout=10)
-    try:
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA busy_timeout=10000")
-        await db.execute("PRAGMA foreign_keys=ON")
-        yield db
-    finally:
-        await db.close()
+    if db_pool is None:
+        raise RuntimeError("DATABASE_URL 연결 풀이 초기화되지 않았습니다.")
+    async with db_pool.acquire() as conn:
+        yield PGConnection(conn)
 
 
 async def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    async with db_connect() as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.executescript(SCHEMA)
-        # Lightweight additive migration for databases created by earlier drafts.
-        columns = {r[1] for r in await (await db.execute("PRAGMA table_info(users)")).fetchall()}
-        if "display_name" not in columns:
-            await db.execute("ALTER TABLE users ADD COLUMN display_name TEXT")
-        if "display_name_updated_at" not in columns:
-            await db.execute("ALTER TABLE users ADD COLUMN display_name_updated_at TEXT")
-
-        mention_columns = {r[1] for r in await (await db.execute("PRAGMA table_info(mentions)")).fetchall()}
-        if mention_columns and "status" not in mention_columns:
-            # Migrate the earlier draft schema (delivered INTEGER) without losing pending records.
-            await db.execute("ALTER TABLE mentions RENAME TO mentions_legacy")
-            await db.execute("""CREATE TABLE mentions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT,
-                chat_id TEXT NOT NULL,
-                sender_id TEXT NOT NULL,
-                target_id TEXT,
-                original_text TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending'
-                  CHECK(status IN ('pending','processing','delivered','unresolved')),
-                processing_token TEXT,
-                processing_since TEXT,
-                delivered_at TEXT
-            )""")
-            legacy_columns = {r[1] for r in await (await db.execute("PRAGMA table_info(mentions_legacy)")).fetchall()}
-            delivered_expr = "CASE WHEN delivered=1 THEN 'delivered' ELSE 'pending' END" if "delivered" in legacy_columns else "'pending'"
-            delivered_at_expr = "CASE WHEN delivered=1 THEN created_at ELSE NULL END" if "delivered" in legacy_columns else "NULL"
-            await db.execute(f"""INSERT INTO mentions
-                (id,event_id,chat_id,sender_id,target_id,original_text,created_at,status,delivered_at)
-                SELECT id,event_id,chat_id,sender_id,target_id,original_text,created_at,
-                       {delivered_expr}, {delivered_at_expr}
-                FROM mentions_legacy""")
-            await db.execute("DROP TABLE mentions_legacy")
-        else:
-            for name, declaration in (
-                ("processing_token", "TEXT"),
-                ("processing_since", "TEXT"),
-                ("delivered_at", "TEXT"),
-            ):
-                if name not in mention_columns:
-                    await db.execute(f"ALTER TABLE mentions ADD COLUMN {name} {declaration}")
-
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_mentions_pending ON mentions(chat_id, target_id, status, id)")
-        await db.commit()
+    global db_pool
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL 환경변수를 설정해 주세요. Neon PostgreSQL 연결 문자열을 사용해야 합니다."
+        )
+    normalized_dsn, ssl_setting = asyncpg_connection_args(DATABASE_URL)
+    db_pool = await asyncpg.create_pool(
+        dsn=normalized_dsn,
+        min_size=DB_POOL_MIN,
+        max_size=DB_POOL_MAX,
+        command_timeout=30,
+        ssl=ssl_setting,
+    )
+    try:
+        async with db_pool.acquire() as conn:
+            for statement in SCHEMA.split(";"):
+                if statement.strip():
+                    await conn.execute(statement)
+            # 기존 PostgreSQL 스키마가 일부 컬럼 없이 만들어졌더라도 안전하게 추가한다.
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT")
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name_updated_at TEXT")
+            await conn.execute("ALTER TABLE mentions ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending'")
+            await conn.execute("ALTER TABLE mentions ADD COLUMN IF NOT EXISTS processing_token TEXT")
+            await conn.execute("ALTER TABLE mentions ADD COLUMN IF NOT EXISTS processing_since TEXT")
+            await conn.execute("ALTER TABLE mentions ADD COLUMN IF NOT EXISTS delivered_at TEXT")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_mentions_pending ON mentions(chat_id, target_id, status, id)")
+            # 이전 스키마에 status가 없었다면 기존 delivered 값이 있던 행을 최대한 보존한다.
+            old_columns = await conn.fetch("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='mentions'
+            """)
+            names = {row["column_name"] for row in old_columns}
+            if "delivered" in names:
+                await conn.execute("""
+                    UPDATE mentions SET status = CASE WHEN delivered THEN 'delivered' ELSE 'pending' END
+                    WHERE status = 'pending'
+                """)
+    except Exception:
+        await db_pool.close()
+        db_pool = None
+        raise
 
 
 async def record_event(event_id, user_id, chat_id, message_type, message_text, targets, unresolved):
     now = iso_now()
     async with db_connect() as db:
-        await db.execute("BEGIN IMMEDIATE")
+        await db.execute("BEGIN")
         try:
             if event_id:
                 cur = await db.execute(
@@ -358,7 +402,7 @@ async def claim_pending_mentions(chat_id: str, target_id: str, limit: int):
     now = iso_now()
     stale_before = (utc_now() - timedelta(minutes=3)).isoformat()
     async with db_connect() as db:
-        await db.execute("BEGIN IMMEDIATE")
+        await db.execute("BEGIN")
         try:
             # Recover claims stranded by a crashed worker. This is at-least-once, not exactly-once.
             await db.execute(
@@ -369,7 +413,7 @@ async def claim_pending_mentions(chat_id: str, target_id: str, limit: int):
             rows = await (await db.execute(
                 """SELECT id,sender_id,original_text,created_at FROM mentions
                    WHERE chat_id=? AND target_id=? AND status='pending'
-                   ORDER BY id LIMIT ?""",
+                   ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED""",
                 (chat_id, target_id, limit),
             )).fetchall()
             ids = [r["id"] for r in rows]
@@ -511,6 +555,8 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
         await client.close()
+        if db_pool is not None:
+            await db_pool.close()
 
 
 app = FastAPI(title="LINE Community Bot", version="1.0.0", lifespan=lifespan)
