@@ -203,32 +203,59 @@ async def init_db():
     """Initialize PostgreSQL and restore persisted activity settings."""
     global MALE_GROUP_EMOJIS, FEMALE_GROUP_EMOJIS
     global MALE_DAILY_MIN_MESSAGES, FEMALE_DAILY_MIN_MESSAGES
+
     try:
         loaded = await database.initialize_database()
+
         if "activity_male_emojis" in loaded:
-            MALE_GROUP_EMOJIS = tuple(json.loads(loaded["activity_male_emojis"]))
+            MALE_GROUP_EMOJIS = tuple(
+                json.loads(loaded["activity_male_emojis"])
+            )
+
         if "activity_female_emojis" in loaded:
-            FEMALE_GROUP_EMOJIS = tuple(json.loads(loaded["activity_female_emojis"]))
+            FEMALE_GROUP_EMOJIS = tuple(
+                json.loads(loaded["activity_female_emojis"])
+            )
+
         if set(MALE_GROUP_EMOJIS) & set(FEMALE_GROUP_EMOJIS):
-            raise RuntimeError("DB의 남성/여성 이모티콘 설정이 중복됩니다. !소통설정으로 수정해 주세요.")
+            raise RuntimeError(
+                "DB의 남성/여성 이모티콘 설정이 중복됩니다. "
+                "!소통설정으로 수정해 주세요."
+            )
+
         if "activity_male_min" in loaded:
-            MALE_DAILY_MIN_MESSAGES = max(1, int(loaded["activity_male_min"]))
+            MALE_DAILY_MIN_MESSAGES = max(
+                1, int(loaded["activity_male_min"])
+            )
+
         if "activity_female_min" in loaded:
-            FEMALE_DAILY_MIN_MESSAGES = max(1, int(loaded["activity_female_min"]))
-        # DB에 아직 값이 없는 경우에만 환경변수 기본값을 최초 설정으로 저장한다.
+            FEMALE_DAILY_MIN_MESSAGES = max(
+                1, int(loaded["activity_female_min"])
+            )
+
         defaults = {
-            "activity_male_emojis": json.dumps(list(MALE_GROUP_EMOJIS), ensure_ascii=False),
-            "activity_female_emojis": json.dumps(list(FEMALE_GROUP_EMOJIS), ensure_ascii=False),
+            "activity_male_emojis": json.dumps(
+                list(MALE_GROUP_EMOJIS), ensure_ascii=False
+            ),
+            "activity_female_emojis": json.dumps(
+                list(FEMALE_GROUP_EMOJIS), ensure_ascii=False
+            ),
             "activity_male_min": str(MALE_DAILY_MIN_MESSAGES),
             "activity_female_min": str(FEMALE_DAILY_MIN_MESSAGES),
         }
+
         async with db_connect() as db:
             for key, value in defaults.items():
                 await db.execute(
-                    "INSERT INTO bot_metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING",
+                    """
+                    INSERT INTO bot_metadata(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key) DO NOTHING
+                    """,
                     (key, value),
                 )
             await db.commit()
+
     except Exception:
         await database.close_pool()
         raise
@@ -343,24 +370,26 @@ async def cleanup_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with init_db():
-        client = AsyncApiClient(configuration)
-        app.state.line_api = AsyncMessagingApi(client)
-        app.state.line_blob_api = AsyncMessagingApiBlob(client)
+    await init_db()
 
-        task = asyncio.create_task(cleanup_loop())
+    client = AsyncApiClient(configuration)
+    app.state.line_api = AsyncMessagingApi(client)
+    app.state.line_blob_api = AsyncMessagingApiBlob(client)
+
+    task = asyncio.create_task(cleanup_loop())
+
+    try:
+        yield
+    finally:
+        task.cancel()
 
         try:
-            yield
-        finally:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            await task
+        except asyncio.CancelledError:
+            pass
 
-            await client.close()
-            await database.close_pool()
+        await client.close()
+        await database.close_pool()
 
 
 
