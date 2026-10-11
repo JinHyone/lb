@@ -198,7 +198,7 @@ async def create_database_export() -> str:
 
 
 
-@asynccontextmanager
+
 async def init_db():
     """Initialize PostgreSQL and restore persisted activity settings."""
     global MALE_GROUP_EMOJIS, FEMALE_GROUP_EMOJIS
@@ -340,23 +340,28 @@ async def cleanup_loop():
         await asyncio.sleep(24 * 60 * 60)
 
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
-    client = AsyncApiClient(configuration)
-    app.state.line_api = AsyncMessagingApi(client)
-    app.state.line_blob_api = AsyncMessagingApiBlob(client)
-    task = asyncio.create_task(cleanup_loop())
-    try:
-        yield
-    finally:
-        task.cancel()
+    async with init_db():
+        client = AsyncApiClient(configuration)
+        app.state.line_api = AsyncMessagingApi(client)
+        app.state.line_blob_api = AsyncMessagingApiBlob(client)
+
+        task = asyncio.create_task(cleanup_loop())
+
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        await client.close()
-        await database.close_pool()
+            yield
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+            await client.close()
+            await database.close_pool()
+
 
 
 app = FastAPI(title="LINE 커뮤니티 봇", version="1.0.0", lifespan=lifespan)
