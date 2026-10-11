@@ -4,8 +4,8 @@ import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from .database import db_connect
-from .line_utils import iso_now, utc_now
+from database import db_connect
+from line_utils import iso_now, utc_now
 
 TIMEZONE_NAME = os.getenv("TIMEZONE", "Asia/Seoul")
 RETENTION_DAYS = max(0, int(os.getenv("RETENTION_DAYS", "180")))

@@ -32,13 +32,12 @@ from linebot.v3.webhooks import MessageEvent
 
 load_dotenv()
 
-from linebot_app import database
-from linebot_app.commands import parse_command
-from linebot_app.database import db_connect
-from linebot_app.line_utils import (
+from commands import parse_command
+from database import db_connect
+from line_utils import (
     event_occurred_at, field, iso_now, mention_targets, source_identity, utc_now,
 )
-from linebot_app.services import (
+from services import (
     claim_pending_mentions, cleanup_old_data, finish_claim, low_activity_users,
     membership_history, record_event, record_membership_event, statistics,
     warning_count,
