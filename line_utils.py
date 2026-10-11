@@ -12,6 +12,16 @@ def field(obj, *names, default=None):
     return default
 
 
+def utc_now() -> datetime:
+    """현재 UTC 시각을 timezone-aware datetime으로 반환한다."""
+    return datetime.now(timezone.utc)
+
+
+def iso_now() -> str:
+    """현재 UTC 시각을 ISO 8601 문자열로 반환한다."""
+    return utc_now().isoformat()
+
+
 def source_identity(source) -> tuple[str | None, str | None, str]:
     """Return (user_id, chat_id, source_type) without inventing missing IDs."""
     source_type = field(source, "type", default="unknown")

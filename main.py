@@ -32,6 +32,7 @@ from linebot.v3.webhooks import MessageEvent
 
 load_dotenv()
 
+import database
 from commands import parse_command
 from database import db_connect
 from line_utils import (
@@ -198,8 +199,6 @@ async def create_database_export() -> str:
 
 
 @asynccontextmanager
-
-
 async def init_db():
     """Initialize PostgreSQL and restore persisted activity settings."""
     global MALE_GROUP_EMOJIS, FEMALE_GROUP_EMOJIS
